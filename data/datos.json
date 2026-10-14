@@ -1,0 +1,143 @@
+{
+  "clientes": [
+    {
+      "id": "C001",
+      "nombre": "María García López",
+      "cc": "1090123456",
+      "cuenta": "****1234",
+      "email": "maria.garcia@email.com",
+      "telefono": "3001234567",
+      "ciudad": "Bogotá",
+      "estado": "activo",
+      "limite_qr": 500000
+    },
+    {
+      "id": "C002",
+      "nombre": "Carlos Ruiz Martínez",
+      "cc": "79456789",
+      "cuenta": "****5678",
+      "email": "carlos.ruiz@email.com",
+      "telefono": "3109876543",
+      "ciudad": "Medellín",
+      "estado": "activo",
+      "limite_qr": 1000000
+    },
+    {
+      "id": "C003",
+      "nombre": "Lucía Moreno Castro",
+      "cc": "52987654",
+      "cuenta": "****9012",
+      "email": "lucia.moreno@email.com",
+      "telefono": "3205551234",
+      "ciudad": "Cali",
+      "estado": "activo",
+      "limite_qr": 300000
+    }
+  ],
+  "transacciones": [
+    {
+      "id": "T001",
+      "cliente_id": "C001",
+      "comercio": "Supermercado El Éxito",
+      "monto": 87500,
+      "fecha": "2024-01-15T14:23:00",
+      "tipo": "QR",
+      "estado": "aprobada",
+      "referencia": "REF2024011501",
+      "nota": "Compra legítima"
+    },
+    {
+      "id": "T002",
+      "cliente_id": "C001",
+      "comercio": "Supermercado El Éxito",
+      "monto": 87500,
+      "fecha": "2024-01-15T14:23:47",
+      "tipo": "QR",
+      "estado": "aprobada",
+      "referencia": "REF2024011501",
+      "nota": "DOBLE COBRO: misma referencia, 47 segundos después"
+    },
+    {
+      "id": "T003",
+      "cliente_id": "C001",
+      "comercio": "Farmacia Drogas La Rebaja",
+      "monto": 34200,
+      "fecha": "2024-01-14T10:15:00",
+      "tipo": "Débito",
+      "estado": "aprobada",
+      "referencia": "REF2024011401"
+    },
+    {
+      "id": "T004",
+      "cliente_id": "C001",
+      "comercio": "Netflix Colombia",
+      "monto": 22900,
+      "fecha": "2024-01-13T00:00:00",
+      "tipo": "Débito automático",
+      "estado": "aprobada",
+      "referencia": "REF2024011301"
+    },
+    {
+      "id": "T005",
+      "cliente_id": "C001",
+      "comercio": "Tienda D1",
+      "monto": 156000,
+      "fecha": "2024-01-12T18:45:00",
+      "tipo": "Débito",
+      "estado": "aprobada",
+      "referencia": "REF2024011201"
+    },
+    {
+      "id": "T006",
+      "cliente_id": "C002",
+      "comercio": "Gasolinera Terpel",
+      "monto": 120000,
+      "fecha": "2024-01-15T08:30:00",
+      "tipo": "Débito",
+      "estado": "aprobada",
+      "referencia": "REF2024011502"
+    },
+    {
+      "id": "T007",
+      "cliente_id": "C002",
+      "comercio": "Amazon Colombia",
+      "monto": 450000,
+      "fecha": "2024-01-10T20:12:00",
+      "tipo": "Débito",
+      "estado": "aprobada",
+      "referencia": "REF2024011002"
+    },
+    {
+      "id": "T008",
+      "cliente_id": "C003",
+      "comercio": "Rappi Colombia",
+      "monto": 68900,
+      "fecha": "2024-01-15T19:00:00",
+      "tipo": "QR",
+      "estado": "aprobada",
+      "referencia": "REF2024011503"
+    },
+    {
+      "id": "T009",
+      "cliente_id": "C003",
+      "comercio": "Rappi Colombia",
+      "monto": 68900,
+      "fecha": "2024-01-15T19:00:31",
+      "tipo": "QR",
+      "estado": "aprobada",
+      "referencia": "REF2024011503",
+      "nota": "Posible doble cobro"
+    },
+    {
+      "id": "T010",
+      "cliente_id": "C002",
+      "comercio": "Comercio Desconocido",
+      "monto": 2500000,
+      "fecha": "2024-01-15T03:17:00",
+      "tipo": "QR",
+      "estado": "aprobada",
+      "referencia": "REF2024011599",
+      "nota": "SOSPECHOSA: madrugada, monto alto, comercio no habitual"
+    }
+  ]
+}
