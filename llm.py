@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from pathlib import Path
 from typing import Generator, Iterator, Optional, Tuple
 
 from pydantic import BaseModel, ValidationError, field_validator
@@ -94,37 +95,21 @@ class Emocion(BaseModel):
         return " ".join(str(v).split()[:10])
 
 
-# ─── System prompts ───────────────────────────────────────────────────────────
+# ─── System prompts (cargados desde prompts/*.md) ───────────────────────────────
 
-_SISTEMA_DECISION = """Eres un clasificador de mensajes para un banco colombiano.
-Analiza el mensaje del cliente y determina el agente más adecuado.
+_PROMPTS_DIR = Path(__file__).parent / "prompts"
 
-AGENTES:
-- FRAUDE: transacciones no reconocidas, uso no autorizado, robo, phishing, clonación de tarjeta
-- REVERSOS: doble cobro, devolución de dinero, error en monto, cajero sin dispensar, reverso de pago
-- PQR: quejas, peticiones, reclamos, información, certificados, productos bancarios
-- FUERA_DE_ALCANCE: temas sin relación con el banco
 
-REGLAS:
-- indicio_fraude: true si hay señales de uso no autorizado o fraude
-- urgencia: 1=baja, 5=crítica (usa 4-5 para fraude activo o montos altos)
-- requiere_aclaracion: true SOLO si el mensaje es demasiado vago para enrutar
-- monto: extrae el valor numérico si se menciona, null si no hay
-- razon: máximo 20 palabras
+def _cargar_prompt(nombre: str) -> str:
+    return (_PROMPTS_DIR / f"{nombre}.md").read_text(encoding="utf-8").strip()
 
-Responde ÚNICAMENTE con el JSON solicitado, sin texto adicional."""
 
-_SISTEMA_EMOCION = """Analiza el estado emocional del cliente en este mensaje bancario.
-
-EMOCIONES POSIBLES: neutral, confundido, frustrado, enojado, ansioso
-INTENSIDAD: baja, media, alta
-
-Responde ÚNICAMENTE con el JSON solicitado, sin texto adicional."""
-
-_SISTEMA_REDACCION = """Eres un asistente bancario empático y profesional de un banco colombiano.
-Redacta una respuesta breve para el cliente en español.
-Máximo 3 oraciones. Si hay números de caso o tickets, menciónalos EXACTAMENTE como te los indiquen.
-Tono: cálido, claro y tranquilizador."""
+# La política ("definición legible" de reglas blandas) se inyecta en el prompt de
+# decisión para que el modelo la conozca. Las reglas duras viven además en código.
+_POLITICA = _cargar_prompt("politica")
+_SISTEMA_DECISION = _cargar_prompt("decision") + "\n\n--- POLÍTICA DE ATENCIÓN ---\n" + _POLITICA
+_SISTEMA_EMOCION = _cargar_prompt("emocion")
+_SISTEMA_REDACCION = _cargar_prompt("redaccion")
 
 
 # ─── Mock helpers ─────────────────────────────────────────────────────────────
@@ -210,6 +195,7 @@ def decidir(
         return d, {
             "latencia_ms": round((time.time() - t0) * 1000, 1),
             "tokens_prompt": 0, "tokens_respuesta": 0, "modelo": "mock",
+            "es_fallback": False,
         }
 
     schema = Decision.model_json_schema()
@@ -229,7 +215,7 @@ def decidir(
                 "latencia_ms": round((time.time() - t0) * 1000, 1),
                 "tokens_prompt": getattr(resp, "prompt_eval_count", 0) or 0,
                 "tokens_respuesta": getattr(resp, "eval_count", 0) or 0,
-                "modelo": modelo,
+                "modelo": modelo, "es_fallback": False,
             }
         except (ValidationError, Exception) as e:
             if intento == 0:
@@ -240,6 +226,7 @@ def decidir(
                 "latencia_ms": round((time.time() - t0) * 1000, 1),
                 "tokens_prompt": 0, "tokens_respuesta": 0,
                 "modelo": f"{modelo}(fallback-mock)", "error": str(e)[:120],
+                "es_fallback": True,
             }
 
 
@@ -310,14 +297,17 @@ def clasificar_emocion(
     Returns (Emocion | None, timed_out).
     If timed_out is True, the caller should use the previous turn's emotion.
     """
-    with ThreadPoolExecutor(max_workers=1) as executor:
+    # Sin `with`: su __exit__ hace shutdown(wait=True) y esperaría al hilo igual,
+    # anulando el timeout. Cerramos sin esperar y cancelando el futuro.
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
         fut = executor.submit(clasificar_emocion_raw, mensaje, modelo, mock, simulated_delay_ms)
         try:
             return fut.result(timeout=timeout_ms / 1000), False
-        except FutureTimeout:
-            return None, True
         except Exception:
             return None, True
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def redactar(

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from agentes import AGENTES, identificar_cliente
@@ -178,20 +181,48 @@ def _extraer_hechos(resultados_agentes: list[dict]) -> dict:
     return hechos
 
 
+# Tickets con formato banco (REV-xxxxxxxx, BLQ-xxxxxxxx, …)
 _TICKET_PATTERN = re.compile(r"\b([A-Z]+-[0-9A-Fa-f]{8})\b")
+# Cualquier secuencia "larga" de dígitos que el redactor podría presentar como
+# número de caso/ticket (ej. "ticket 123456"). Umbral: ≥ 5 dígitos.
+_NUM_LARGO_PATTERN = re.compile(r"\b\d{5,}\b")
+
+
+def _normalizar_monto(valor: str) -> Optional[float]:
+    """Convierte '87.500' / '87,500' / '87500' a float, o None si no se puede."""
+    limpio = valor.replace(".", "").replace(",", "")
+    try:
+        return float(limpio)
+    except ValueError:
+        return None
 
 
 def _guardia_redactor(texto: str, hechos: dict) -> tuple[Optional[str], bool]:
-    """Verify ticket IDs in the text are in known facts.
+    """Verifica que todo ID/número de caso del texto esté entre los hechos conocidos.
+
+    Cubre tanto tickets con formato (REV-xxxxxxxx) como números sueltos largos
+    (ej. 'ticket 123456'). Un número suelto se considera legítimo solo si coincide
+    con un monto conocido; cualquier otro número largo se trata como inventado.
 
     Returns (texto_verificado | None, guardia_activada).
-    Returns (None, True) if an invented ticket is found.
+    Returns (None, True) si se detecta un ticket/número inventado.
     """
+    # 1) Tickets con formato banco
     tickets_en_texto = {t.upper() for t in _TICKET_PATTERN.findall(texto)}
     tickets_conocidos = {t.upper() for t in hechos.get("tickets", set())}
-    inventados = tickets_en_texto - tickets_conocidos
-    if inventados:
+    if tickets_en_texto - tickets_conocidos:
         return None, True
+
+    # 2) Números largos sueltos → solo válidos si son un monto conocido
+    montos_conocidos = {int(m) for m in hechos.get("montos", set())}
+    for num in _NUM_LARGO_PATTERN.findall(texto):
+        # Ignorar los que ya son parte de un ticket con formato
+        if any(num in t for t in tickets_en_texto):
+            continue
+        valor = _normalizar_monto(num)
+        if valor is None or int(valor) not in montos_conocidos:
+            return None, True
+
     return texto, False
 
 
@@ -199,6 +230,34 @@ def _mayoria(decisiones: list[Decision]) -> tuple[str, float]:
     conteo = Counter(d.agente for d in decisiones)
     ganador, votos = conteo.most_common(1)[0]
     return ganador, votos / len(decisiones)
+
+
+def _registrar_auditoria(path: str, session: SessionState, mensaje: str, r: ResultadoProcesamiento) -> None:
+    """Escribe una línea JSON por turno con lo decidido (registro para riesgo).
+
+    Determinista y legible: decisión, reglas disparadas, escalado y tickets.
+    """
+    registro = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "session_id": session.id,
+        "turno": session.turno,
+        "cliente_id": session.cliente_id,
+        "mensaje": mensaje[:200],
+        "agente_ganador": r.agente_ganador,
+        "acuerdo": r.acuerdo,
+        "agentes_ejecutados": r.agentes_ejecutados,
+        "reglas_disparadas": [reg["num"] for reg in r.reglas_disparadas if reg.get("disparada")],
+        "escalado_humano": r.escalado_humano,
+        "razon_escalado": r.razon_escalado,
+        "guardia_activada": r.guardia_activada,
+        "tickets": sorted(session.hechos.get("tickets", [])) if session.hechos else [],
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(registro, ensure_ascii=False) + "\n")
+    except Exception:
+        # La auditoría nunca debe tumbar el turno
+        pass
 
 
 # ─── Orquestador ─────────────────────────────────────────────────────────────
@@ -217,7 +276,9 @@ class Orquestador:
         cliente_id: str = "C001",
         emotion_timeout_ms: int = 1200,
         emotion_delay_ms: int = 0,
+        decision_timeout_ms: int = 8000,
         requiere_identificacion: bool = False,
+        audit_path: Optional[str] = None,
     ):
         self.modelo_decision = modelo_decision
         self.modelo_redaccion = modelo_redaccion
@@ -230,12 +291,19 @@ class Orquestador:
         self.cliente_id = cliente_id
         self.emotion_timeout_ms = emotion_timeout_ms
         self.emotion_delay_ms = emotion_delay_ms
+        self.decision_timeout_ms = decision_timeout_ms
         self.requiere_identificacion = requiere_identificacion
+        self.audit_path = audit_path
 
     def procesar(self, mensaje: str, session: Optional[SessionState] = None) -> ResultadoProcesamiento:
         if session is None:
             session = SessionState()
+        r = self._procesar_interno(mensaje, session)
+        if self.audit_path:
+            _registrar_auditoria(self.audit_path, session, mensaje, r)
+        return r
 
+    def _procesar_interno(self, mensaje: str, session: SessionState) -> ResultadoProcesamiento:
         session.turno += 1
         r = ResultadoProcesamiento()
 
@@ -249,7 +317,7 @@ class Orquestador:
                 "Un especialista revisará su caso."
             )
             r.reglas_disparadas.append({
-                "num": 7, "desc": "manipulación detectada → bloqueo inmediato (prioridad máxima)",
+                "num": 1, "desc": "manipulación detectada → bloqueo inmediato (prioridad máxima)",
                 "disparada": True, "detalle": "Se detectaron instrucciones para eludir reglas del sistema",
             })
             session.escalado = True
@@ -274,7 +342,7 @@ class Orquestador:
                 "No se requieren más acciones de su parte."
             )
             r.reglas_disparadas.append({
-                "num": 8, "desc": "sesión ya escalada → mantener en atención humana",
+                "num": 3, "desc": "sesión ya escalada → mantener en atención humana",
                 "disparada": True, "detalle": session.razon_escalado,
             })
             session.contactos_mismo_caso += 1
@@ -282,22 +350,25 @@ class Orquestador:
             session.historial.append({"turno": session.turno, "rol": "sistema", "texto": r.respuesta_final})
             return r
 
-        session.contactos_mismo_caso += 1
-
         # ── Seguimiento: usar estado guardado ────────────────────────────────
         if es_seguimiento(mensaje, session) and self.ronda == 3:
             r.es_seguimiento = True
+            # Un seguimiento sobre un caso existente SÍ cuenta como contacto.
+            session.contactos_mismo_caso += 1
             r = self._procesar_seguimiento(mensaje, r, session)
             session.historial.append({"turno": session.turno, "rol": "cliente", "texto": mensaje[:100]})
             session.historial.append({"turno": session.turno, "rol": "sistema", "texto": r.respuesta_final})
             return r
 
         # ── Paso 1: Decisiones + emoción en paralelo ─────────────────────────
+        # No usamos `with`: su __exit__ hace shutdown(wait=True) y anularía el
+        # timeout de emoción (esperaría al hilo igual). Cerramos sin esperar.
         decision_results = []
         emocion_raw = None
         emocion_timed_out = False
 
-        with ThreadPoolExecutor(max_workers=self.corridas + 1) as executor:
+        executor = ThreadPoolExecutor(max_workers=self.corridas + 1)
+        try:
             fut_decisions = [
                 executor.submit(decidir, mensaje, self.modelo_decision, self.mock, self.temperatura)
                 for _ in range(self.corridas)
@@ -309,7 +380,7 @@ class Orquestador:
 
             for fut in fut_decisions:
                 try:
-                    decision_results.append(fut.result())
+                    decision_results.append(fut.result(timeout=self.decision_timeout_ms / 1000))
                 except Exception:
                     pass
 
@@ -318,16 +389,42 @@ class Orquestador:
                 emocion_timed_out = False
             except Exception:
                 emocion_timed_out = True
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         if not decision_results:
             from llm import _mock_decision
-            decision_results = [(_mock_decision(mensaje), {"latencia_ms": 0, "tokens_prompt": 0, "tokens_respuesta": 0, "modelo": "fallback-mock"})]
+            decision_results = [(_mock_decision(mensaje), {"latencia_ms": 0, "tokens_prompt": 0, "tokens_respuesta": 0, "modelo": "fallback-mock", "es_fallback": True})]
 
         for d, m in decision_results:
             r.decisiones.append(d)
             r.metricas_decision.append(m)
 
         r.agente_ganador, r.acuerdo = _mayoria(r.decisiones)
+
+        # ── FAIL-SAFE: si el clasificador de decisión no está disponible (todas
+        # las corridas cayeron a respaldo por palabras clave), NO se ejecutan
+        # agentes con esa clasificación: se escala a humano.
+        clasificador_caido = not self.mock and all(
+            m.get("es_fallback") for m in r.metricas_decision
+        )
+        if clasificador_caido:
+            r.escalado_humano = True
+            r.razon_escalado = "Clasificador de decisión no disponible — escalado por seguridad (fail-safe)"
+            r.reglas_disparadas.append({
+                "num": 2, "desc": "fail-safe: clasificador de decisión caído → escalar",
+                "disparada": True, "detalle": "todas las corridas usaron respaldo por palabras clave",
+            })
+            r.respuesta_final = (
+                "Estamos teniendo una dificultad técnica para procesar su solicitud de forma segura. "
+                "Un asesor revisará su caso en breve."
+            )
+            session.escalado = True
+            session.razon_escalado = r.razon_escalado
+            self._actualizar_session_emocion(r, session)
+            session.historial.append({"turno": session.turno, "rol": "cliente", "texto": mensaje[:100]})
+            session.historial.append({"turno": session.turno, "rol": "sistema", "texto": r.respuesta_final})
+            return r
 
         # ── Emoción: fallback a t-1 si timeout ───────────────────────────────
         if emocion_timed_out:
@@ -364,7 +461,7 @@ class Orquestador:
                 if not d.indicio_fraude:
                     d.indicio_fraude = True
         r.reglas_disparadas.append({
-            "num": 6,
+            "num": 4,
             "desc": "'no reconozco/autoricé' → activa indicio_fraude",
             "disparada": hay_no_reconozco,
             "detalle": "frase de no reconocimiento detectada" if hay_no_reconozco else "",
@@ -379,7 +476,7 @@ class Orquestador:
         if regla1:
             agentes.append("FRAUDE")
         r.reglas_disparadas.append({
-            "num": 1, "desc": "indicio_fraude → ejecutar agente FRAUDE",
+            "num": 5, "desc": "indicio_fraude → ejecutar agente FRAUDE",
             "disparada": regla1,
             "detalle": f"indicio_fraude={'sí' if hay_fraude else 'no'}" if regla1 else "",
         })
@@ -390,7 +487,7 @@ class Orquestador:
             r.escalado_humano = True
             r.razon_escalado = f"Urgencia {max_urgencia}/5 y monto ${monto:,.0f} > umbral ${self.umbral_monto:,.0f}"
         r.reglas_disparadas.append({
-            "num": 2, "desc": f"urgencia ≥ 4 y monto > ${self.umbral_monto:,.0f} → escalar",
+            "num": 6, "desc": f"urgencia ≥ 4 y monto > ${self.umbral_monto:,.0f} → escalar",
             "disparada": regla2,
             "detalle": f"urgencia={max_urgencia}, monto=${monto:,.0f}" if regla2 else "",
         })
@@ -404,7 +501,7 @@ class Orquestador:
                 "Por ejemplo: fecha, comercio o monto involucrado."
             )
         r.reglas_disparadas.append({
-            "num": 3, "desc": "requiere_aclaracion → preguntar al cliente en lugar de enrutar",
+            "num": 7, "desc": "requiere_aclaracion → preguntar al cliente en lugar de enrutar",
             "disparada": regla3, "detalle": "mensaje demasiado vago" if regla3 else "",
         })
 
@@ -414,9 +511,15 @@ class Orquestador:
             r.escalado_humano = True
             r.razon_escalado = f"Acuerdo {r.acuerdo:.0%} < umbral {self.umbral_acuerdo:.0%} en {self.corridas} corridas"
         r.reglas_disparadas.append({
-            "num": 4, "desc": f"autoconsistencia < {self.umbral_acuerdo:.0%} → escalar",
+            "num": 8, "desc": f"autoconsistencia < {self.umbral_acuerdo:.0%} → escalar",
             "disparada": regla4, "detalle": f"acuerdo={r.acuerdo:.0%}" if regla4 else "",
         })
+
+        # Contar el contacto solo si es un contacto real sobre un caso: enruta a
+        # un agente de caso (no FUERA_DE_ALCANCE) y no es una petición de
+        # aclaración. Así saludos y mensajes vagos no inflan la Regla 5.
+        if r.agente_ganador != "FUERA_DE_ALCANCE" and not r.requiere_aclaracion:
+            session.contactos_mismo_caso += 1
 
         # Regla 5: enojo/frustración alta + ≥2 contactos → escalar
         emocion_actual = r.emocion.emocion if r.emocion else session.emocion_previa
@@ -433,7 +536,7 @@ class Orquestador:
                 f"#{session.contactos_mismo_caso} sobre el mismo caso"
             )
         r.reglas_disparadas.append({
-            "num": 5,
+            "num": 9,
             "desc": "enojo/frustración alta + ≥2 contactos → escalar a humano",
             "disparada": regla5,
             "detalle": f"emoción={emocion_actual}, intensidad={intensidad_actual}, contactos={session.contactos_mismo_caso}" if regla5 else "",
@@ -511,10 +614,12 @@ class Orquestador:
         r.agentes_ejecutados = [res["agente"] for res in r.resultados_agentes]
         r.agentes_a_ejecutar = r.agentes_ejecutados
 
-        # Run emotion in background (with timeout) — still needed for rule 5
+        # Run emotion in background (with timeout) — still needed for rule 5.
+        # Sin `with`: evitamos que shutdown(wait=True) anule el timeout.
         emocion_raw = None
         emocion_timed_out = False
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
             fut_em = executor.submit(
                 clasificar_emocion_raw,
                 mensaje, self.modelo_decision, self.mock, self.emotion_delay_ms,
@@ -523,6 +628,8 @@ class Orquestador:
                 emocion_raw = fut_em.result(timeout=self.emotion_timeout_ms / 1000)
             except Exception:
                 emocion_timed_out = True
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         if emocion_timed_out:
             session.fallbacks_emocion_consecutivos += 1
@@ -556,7 +663,7 @@ class Orquestador:
                 f"#{session.contactos_mismo_caso} sobre el mismo caso"
             )
             r.reglas_disparadas.append({
-                "num": 5,
+                "num": 9,
                 "desc": "enojo/frustración alta + ≥2 contactos → escalar a humano",
                 "disparada": True,
                 "detalle": f"emoción={emocion_actual}, intensidad={intensidad_actual}, contactos={session.contactos_mismo_caso}",

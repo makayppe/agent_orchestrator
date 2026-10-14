@@ -2,39 +2,14 @@
 
 from __future__ import annotations
 
-import json
-import re
 import uuid
-from pathlib import Path
 
-_DATOS = Path(__file__).parent / "data" / "datos.json"
-
-
-def _leer() -> dict:
-    with open(_DATOS, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _cliente(datos: dict, cliente_id: str) -> dict | None:
-    return next((c for c in datos["clientes"] if c["id"] == cliente_id), None)
+import datastore
 
 
 def identificar_cliente(texto: str) -> dict | None:
-    """Busca un cliente por cédula o por los últimos 4 dígitos de la cuenta.
-
-    Devuelve el dict del cliente si algún número del texto coincide, o None.
-    """
-    datos = _leer()
-    for num in re.findall(r"\d{4,}", texto):
-        for c in datos["clientes"]:
-            cuenta_digitos = c["cuenta"].replace("*", "")
-            if num == c["cc"] or num == cuenta_digitos:
-                return c
-    return None
-
-
-def _txs_cliente(datos: dict, cliente_id: str) -> list[dict]:
-    return [t for t in datos["transacciones"] if t["cliente_id"] == cliente_id]
+    """Busca un cliente por cédula o por los últimos 4 dígitos de la cuenta."""
+    return datastore.buscar_cliente_por_identificador(texto)
 
 
 # ─── Fraude ──────────────────────────────────────────────────────────────────
@@ -43,8 +18,7 @@ class AgenteFraude:
     nombre = "FRAUDE"
 
     def bloquear_medio(self, cliente_id: str, medio: str = "QR") -> dict:
-        datos = _leer()
-        cliente = _cliente(datos, cliente_id)
+        cliente = datastore.cliente(cliente_id)
         if not cliente:
             return {"ok": False, "herramienta": "bloquear_medio", "error": "Cliente no encontrado"}
         ticket = f"BLQ-{uuid.uuid4().hex[:8].upper()}"
@@ -73,8 +47,7 @@ class AgenteFraude:
         }
 
     def ejecutar(self, mensaje: str, cliente_id: str = "C001", session=None) -> dict:
-        datos = _leer()
-        txs = _txs_cliente(datos, cliente_id)
+        txs = datastore.transacciones_cliente(cliente_id)
         monto = sum(
             t["monto"] for t in txs
             if "sospechosa" in t.get("nota", "").lower()
@@ -118,10 +91,12 @@ class AgenteFraude:
 
 class AgenteReversos:
     nombre = "REVERSOS"
+    # Tope para reverso automático sin confirmación humana. Por encima de esto,
+    # o si no hay un doble cobro claro, se pide confirmación / se escala.
+    TOPE_REVERSO_AUTOMATICO = 1_000_000
 
     def consultar_transacciones(self, cliente_id: str, limite: int = 5) -> dict:
-        datos = _leer()
-        txs = sorted(_txs_cliente(datos, cliente_id), key=lambda x: x["fecha"], reverse=True)
+        txs = sorted(datastore.transacciones_cliente(cliente_id), key=lambda x: x["fecha"], reverse=True)
         return {
             "ok": True,
             "herramienta": "consultar_transacciones",
@@ -131,8 +106,7 @@ class AgenteReversos:
         }
 
     def solicitar_reverso(self, transaccion_id: str, motivo: str) -> dict:
-        datos = _leer()
-        tx = next((t for t in datos["transacciones"] if t["id"] == transaccion_id), None)
+        tx = datastore.transaccion(transaccion_id)
         if not tx:
             return {
                 "ok": False,
@@ -160,7 +134,9 @@ class AgenteReversos:
         r_txs = self.consultar_transacciones(cliente_id)
         txs = r_txs["transacciones"]
 
-        # Detectar doble cobro (mismo comercio + mismo monto en lista)
+        # Solo se reversa automáticamente ante un DOBLE COBRO claro
+        # (mismo comercio + mismo monto). Si no lo hay, NO se reversa la
+        # transacción más reciente a ciegas: se pide confirmación.
         tx_revertir = None
         for i, tx in enumerate(txs):
             for tx2 in txs[i + 1:]:
@@ -170,34 +146,55 @@ class AgenteReversos:
             if tx_revertir:
                 break
 
-        if not tx_revertir and txs:
-            tx_revertir = txs[0]
-
         herramientas = [r_txs]
-        r_rev = None
-        if tx_revertir:
-            # Idempotency: same monto+comercio in same session → reuse existing reverso ticket
-            if (session and session.reverso_id
-                    and session.reverso_monto == tx_revertir["monto"]
-                    and session.reverso_comercio == tx_revertir["comercio"]):
-                r_rev = {
-                    "ok": True, "herramienta": "solicitar_reverso",
-                    "ticket": session.reverso_id, "monto": tx_revertir["monto"],
-                    "comercio": tx_revertir["comercio"], "motivo": "Idempotente — reverso previo",
-                    "estado": "EN_PROCESO", "tiempo_estimado": "3-5 días hábiles",
-                    "detalle": f"Reverso previo reutilizado: {session.reverso_id}",
-                }
-            else:
-                motivo = "Doble cobro detectado" if tx_revertir.get("nota") else "Reverso solicitado por cliente"
-                r_rev = self.solicitar_reverso(tx_revertir["id"], motivo)
-                if session and r_rev.get("ok"):
-                    session.reverso_id = r_rev["ticket"]
-                    session.reverso_monto = tx_revertir["monto"]
-                    session.reverso_comercio = tx_revertir["comercio"]
-            herramientas.append(r_rev)
+
+        # Caso 1: no hay doble cobro claro → pedir confirmación, sin reversar.
+        if not tx_revertir:
+            return {
+                "agente": self.nombre,
+                "herramientas": herramientas,
+                "requiere_confirmacion": True,
+                "resumen": (
+                    f"Revisadas {len(txs)} transacciones. No se identificó un doble cobro claro; "
+                    "se requiere que el cliente confirme cuál transacción desea reversar."
+                ),
+            }
+
+        # Caso 2: doble cobro por encima del tope → confirmación humana, sin reversar.
+        if tx_revertir["monto"] > self.TOPE_REVERSO_AUTOMATICO:
+            return {
+                "agente": self.nombre,
+                "herramientas": herramientas,
+                "requiere_confirmacion": True,
+                "resumen": (
+                    f"Doble cobro detectado por ${tx_revertir['monto']:,.0f} en {tx_revertir['comercio']}, "
+                    f"por encima del tope de reverso automático (${self.TOPE_REVERSO_AUTOMATICO:,.0f}). "
+                    "Requiere confirmación humana antes de proceder."
+                ),
+            }
+
+        # Caso 3: doble cobro claro y por debajo del tope → reverso automático.
+        # Idempotency: same monto+comercio in same session → reuse existing reverso ticket
+        if (session and session.reverso_id
+                and session.reverso_monto == tx_revertir["monto"]
+                and session.reverso_comercio == tx_revertir["comercio"]):
+            r_rev = {
+                "ok": True, "herramienta": "solicitar_reverso",
+                "ticket": session.reverso_id, "monto": tx_revertir["monto"],
+                "comercio": tx_revertir["comercio"], "motivo": "Idempotente — reverso previo",
+                "estado": "EN_PROCESO", "tiempo_estimado": "3-5 días hábiles",
+                "detalle": f"Reverso previo reutilizado: {session.reverso_id}",
+            }
+        else:
+            r_rev = self.solicitar_reverso(tx_revertir["id"], "Doble cobro detectado")
+            if session and r_rev.get("ok"):
+                session.reverso_id = r_rev["ticket"]
+                session.reverso_monto = tx_revertir["monto"]
+                session.reverso_comercio = tx_revertir["comercio"]
+        herramientas.append(r_rev)
 
         resumen = f"Revisadas {len(txs)} transacciones."
-        if r_rev and r_rev.get("ok"):
+        if r_rev.get("ok"):
             resumen += f" Reverso {r_rev['ticket']} iniciado por ${r_rev['monto']:,.0f}."
 
         return {

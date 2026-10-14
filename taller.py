@@ -368,7 +368,9 @@ def _construir_orquestador(args, requiere_identificacion: bool = False):
         cliente_id=args.cliente,
         emotion_timeout_ms=getattr(args, "emotion_timeout_ms", 1200),
         emotion_delay_ms=getattr(args, "emotion_delay_ms", 0),
+        decision_timeout_ms=getattr(args, "decision_timeout_ms", 8000),
         requiere_identificacion=requiere_identificacion,
+        audit_path="audit.jsonl" if getattr(args, "auditar", False) else None,
     )
 
 
@@ -468,6 +470,64 @@ def modo_lote(args) -> None:
         f"Escalados: {escalados}  "
         f"Latencia media: {total_lat/len(mensajes):.0f}ms  "
         f"Tokens totales: {total_tok}"
+    )
+
+
+def modo_barrido(args) -> None:
+    """Barrido de umbrales: mide acierto vs. tasa de escalado sobre el lote.
+
+    Respalda el mensaje 'el equilibrio automatizar/escalar es medible': al mover
+    el umbral de monto se ve cómo cambian aciertos y escalamientos.
+    """
+    from orquestador import Orquestador
+
+    mensajes = json.loads(MENSAJES_PATH.read_text(encoding="utf-8"))
+
+    # Umbrales de monto a barrer (en millones para legibilidad)
+    umbrales = [500_000, 1_000_000, 2_000_000, 3_000_000, 5_000_000]
+
+    tabla = Table(
+        title=f"[bold]BARRIDO DE UMBRAL DE MONTO — {len(mensajes)} mensajes · {args.modelo_decision}[/]",
+        box=box.ROUNDED, show_header=True, header_style="bold cyan",
+    )
+    tabla.add_column("Umbral monto", justify="right", width=14)
+    tabla.add_column("Acierto", justify="center", width=12)
+    tabla.add_column("Escalados", justify="center", width=11)
+    tabla.add_column("Tasa escalado", justify="right", width=14)
+
+    for umbral in umbrales:
+        args.umbral_monto = umbral
+        orch = _construir_orquestador(args)
+        correctos = 0
+        escalados = 0
+        for msg_data in mensajes:
+            r = orch.procesar(msg_data["mensaje"])
+            etiqueta = msg_data["etiqueta"]
+            manipulacion = getattr(r, "manipulacion_detectada", False)
+            ok = (r.agente_ganador == etiqueta
+                  or (manipulacion and etiqueta == "FUERA_DE_ALCANCE")
+                  or (etiqueta == "REVERSOS" and "REVERSOS" in r.agentes_a_ejecutar)
+                  or (etiqueta == "FRAUDE" and "FRAUDE" in r.agentes_a_ejecutar))
+            if ok:
+                correctos += 1
+            if r.escalado_humano:
+                escalados += 1
+
+        n = len(mensajes)
+        pct_ok = correctos / n * 100
+        pct_esc = escalados / n * 100
+        color_ok = "green" if pct_ok >= 80 else "yellow" if pct_ok >= 60 else "red"
+        tabla.add_row(
+            f"${umbral:,.0f}",
+            f"[{color_ok}]{correctos}/{n} ({pct_ok:.0f}%)[/]",
+            str(escalados),
+            f"{pct_esc:.0f}%",
+        )
+
+    console.print(tabla)
+    console.print(
+        "\n  [dim]Umbral bajo → más escalamientos (más seguro, menos automatizado). "
+        "Umbral alto → menos escalamientos (más automatizado, más riesgo).[/]"
     )
 
 
@@ -572,6 +632,8 @@ Ejemplos:
                         help="Forzar delay en clasificación de emoción (para demo de timeout)")
     parser.add_argument("--emotion-timeout-ms", dest="emotion_timeout_ms", type=int, default=1200,
                         help="Timeout para clasificación de emoción en ms (default: 1200)")
+    parser.add_argument("--decision-timeout-ms", dest="decision_timeout_ms", type=int, default=8000,
+                        help="Timeout para clasificación de decisión en ms (default: 8000)")
     parser.add_argument("--cliente", default="C001",
                         help="ID del cliente para las herramientas (default: C001)")
     parser.add_argument("--chat", action="store_true",
@@ -580,6 +642,10 @@ Ejemplos:
                         help="Alias de --chat (compatibilidad)")
     parser.add_argument("--lote", action="store_true",
                         help="Procesar todos los mensajes de data/mensajes.json")
+    parser.add_argument("--barrido", action="store_true",
+                        help="Barrido de umbral de monto: acierto vs. tasa de escalado")
+    parser.add_argument("--auditar", action="store_true",
+                        help="Registrar cada turno en audit.jsonl")
     parser.add_argument("--mock", action="store_true",
                         help="Modo mock: sin LLM, respuestas fijas (plan B)")
     parser.add_argument("--grabar", action="store_true",
@@ -607,6 +673,8 @@ Ejemplos:
 
     if args.chat or args.interactivo:
         modo_chat(args)
+    elif args.barrido:
+        modo_barrido(args)
     elif args.lote:
         modo_lote(args)
     elif args.mensaje:

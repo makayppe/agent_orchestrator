@@ -3,6 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Artefactos del demo
+audit.jsonl
+cache.json
+
 # C extensions
 *.so
 
