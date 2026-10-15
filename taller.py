@@ -61,8 +61,13 @@ def _tag_emocion(emocion, fuente: str) -> str:
     nombre = emocion.emocion
     intens = emocion.intensidad
     color = COLORES_EMOCION.get(nombre, "white")
-    fuente_txt = f" [dim]({fuente})[/]" if fuente != "t" else ""
-    return f"[{color}]{nombre} / {intens}[/]{fuente_txt}"
+    if fuente == "t":
+        fuente_txt = "  [dim]· fuente: t (llegó a tiempo)[/]"
+    elif fuente == "t-1":
+        fuente_txt = "  [bold yellow]· fuente: t-1 (no llegó a tiempo, se usa la del turno anterior)[/]"
+    else:
+        fuente_txt = f"  [dim]· fuente: {fuente}[/]"
+    return f"Emoción: [{color}]{nombre} / {intens}[/]{fuente_txt}"
 
 
 def mostrar_traza(r, mensaje: str, args, sesion_num: int = 0):
@@ -546,7 +551,7 @@ def modo_chat(args) -> None:
     console.print(Panel(
         "[bold cyan]Modo chat[/] — conversación multi-turno.\n"
         "El bot pedirá identificación (cédula o últimos 4 de la cuenta) antes de atender.\n"
-        "Comandos: [bold]/salir[/] · [bold]/reset[/] (nueva sesión) · [bold]/estado[/] (ver sesión) · [bold]/modelo <nombre>[/]",
+        "Comandos: [bold]/lento [ms][/] (retrasa la emoción) · [bold]/salir[/] · [bold]/reset[/] (nueva sesión) · [bold]/estado[/] (ver sesión) · [bold]/modelo <nombre>[/]",
         border_style="cyan",
     ))
 
@@ -582,6 +587,13 @@ def modo_chat(args) -> None:
             args.modelo_decision = cmd.split(" ", 1)[1].strip()
             orch = _construir_orquestador(args, requiere_identificacion=True)
             console.print(f"[yellow]Modelo de decisión cambiado a: {args.modelo_decision}[/]")
+            continue
+
+        if cmd.startswith("/lento"):
+            partes = cmd.split()
+            args.emotion_delay_ms = int(partes[1]) if len(partes) > 1 else 2000
+            orch = _construir_orquestador(args, requiere_identificacion=True)
+            console.print(f"[yellow]Emoción con retraso de {args.emotion_delay_ms} ms (timeout {args.emotion_timeout_ms} ms). '/lento 0' para quitarlo.[/]")
             continue
 
         if cmd == "/lote":

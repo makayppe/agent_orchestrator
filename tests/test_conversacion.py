@@ -299,6 +299,58 @@ def test_manipulacion_antes_de_identificar():
     assert not r.requiere_identificacion, "No debe pedir ID si es manipulación"
 
 
+
+# ─── Regla 7: el código decide si acepta pedir aclaración ────────────────────
+
+def _fake_3b(requiere_aclaracion: bool, indicio_fraude: bool):
+    """Cliente falso que imita a un 3B que marca como 'vago' un mensaje claro."""
+    class _Fake:
+        def chat(self, **kw):
+            sistema = kw["messages"][0]["content"]
+            if "estructurada" in sistema:
+                return _FakeResp(json.dumps({
+                    "intencion": "solicitud", "agente": "REVERSOS",
+                    "indicio_fraude": indicio_fraude, "urgencia": 4,
+                    "requiere_aclaracion": requiere_aclaracion, "monto": None, "razon": "x"}))
+            if "estado emocional" in sistema:
+                return _FakeResp(json.dumps({"emocion": "confundido", "intensidad": "media", "razon": "x"}))
+            return _FakeResp("Hemos iniciado su solicitud.")
+    return _Fake()
+
+
+def test_ancla_no_pide_aclaracion_aunque_el_modelo_la_pida():
+    """Regresión del demo: el 3B marcó el mensaje ancla como 'demasiado vago'."""
+    import llm as llm_mod
+    from orquestador import Orquestador, SessionState
+
+    llm_mod._test_client = _fake_3b(requiere_aclaracion=True, indicio_fraude=True)
+    try:
+        orch = Orquestador(modelo_decision="x", modelo_redaccion="x", mock=False,
+                           corridas=1, ronda=3, cliente_id="C001", emotion_timeout_ms=3000)
+        r = orch.procesar(
+            "Pagué con QR en un comercio, me cobraron dos veces y no reconozco el segundo cargo.",
+            SessionState())
+    finally:
+        llm_mod._test_client = None
+    assert not r.requiere_aclaracion, "El código no debe aceptar la aclaración ante indicio de fraude"
+    assert "REVERSOS" in r.agentes_ejecutados and "FRAUDE" in r.agentes_ejecutados
+
+
+def test_mensaje_realmente_vago_si_pide_aclaracion():
+    """El control sigue funcionando: un mensaje corto y sin indicios sí pregunta."""
+    import llm as llm_mod
+    from orquestador import Orquestador, SessionState
+
+    llm_mod._test_client = _fake_3b(requiere_aclaracion=True, indicio_fraude=False)
+    try:
+        orch = Orquestador(modelo_decision="x", modelo_redaccion="x", mock=False,
+                           corridas=1, ronda=3, cliente_id="C001", emotion_timeout_ms=3000)
+        r = orch.procesar("Necesito ayuda con mi cuenta.", SessionState())
+    finally:
+        llm_mod._test_client = None
+    assert r.requiere_aclaracion
+    assert not r.agentes_ejecutados
+
 if __name__ == "__main__":
     print("Running tests...")
     test_conversacion_3_turnos_mock()

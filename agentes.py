@@ -12,6 +12,19 @@ def identificar_cliente(texto: str) -> dict | None:
     return datastore.buscar_cliente_por_identificador(texto)
 
 
+_FRASES_DOBLE_COBRO = (
+    "dos veces", "doble cobro", "doble cargo", "duplicad", "me cobraron de más",
+    "me cobraron dos", "cobro repetido", "dos cargos", "cobrado dos",
+)
+
+
+def _reporta_doble_cobro(mensaje: str) -> bool:
+    """Heurística de DOMINIO del agente (no de intención): ¿el cliente está
+    reportando un doble cobro? Solo entonces se reversa el duplicado detectado."""
+    t = mensaje.lower()
+    return any(f in t for f in _FRASES_DOBLE_COBRO)
+
+
 # ─── Fraude ──────────────────────────────────────────────────────────────────
 
 class AgenteFraude:
@@ -137,26 +150,32 @@ class AgenteReversos:
         # Solo se reversa automáticamente ante un DOBLE COBRO claro
         # (mismo comercio + mismo monto). Si no lo hay, NO se reversa la
         # transacción más reciente a ciegas: se pide confirmación.
+        # La lista viene de más nueva a más vieja, así que `tx` es el cobro
+        # DUPLICADO (el segundo) y `tx2` el original → se reversa el duplicado.
         tx_revertir = None
         for i, tx in enumerate(txs):
             for tx2 in txs[i + 1:]:
                 if tx["monto"] == tx2["monto"] and tx["comercio"] == tx2["comercio"]:
-                    tx_revertir = tx2
+                    tx_revertir = tx
                     break
             if tx_revertir:
                 break
 
         herramientas = [r_txs]
 
-        # Caso 1: no hay doble cobro claro → pedir confirmación, sin reversar.
-        if not tx_revertir:
+        # El reverso automático solo procede si el cliente REALMENTE reporta un
+        # doble cobro. Que exista un duplicado en su historial no basta: si se
+        # queja de un cajero o de una suscripción, no debemos reversar el duplicado
+        # de otro comercio. En cualquier otro caso se pide confirmación.
+        if not tx_revertir or not _reporta_doble_cobro(mensaje):
             return {
                 "agente": self.nombre,
                 "herramientas": herramientas,
                 "requiere_confirmacion": True,
                 "resumen": (
-                    f"Revisadas {len(txs)} transacciones. No se identificó un doble cobro claro; "
-                    "se requiere que el cliente confirme cuál transacción desea reversar."
+                    f"Revisadas {len(txs)} transacciones. Para proteger su dinero no se "
+                    "reversa nada automáticamente: se requiere que el cliente confirme "
+                    "cuál transacción desea reversar y por qué."
                 ),
             }
 

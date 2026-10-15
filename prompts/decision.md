@@ -28,7 +28,10 @@ En cada mensaje debes determinar:
 ## 3. Señales adicionales
 - indicio_fraude: true si hay señales de uso no autorizado o fraude.
 - urgencia: 1=baja … 5=crítica (usa 4-5 para fraude activo o montos altos).
-- requiere_aclaracion: true SOLO si el mensaje es demasiado vago para enrutar.
+- requiere_aclaracion: true SOLO si no se puede saber de qué trata el mensaje
+  ("necesito ayuda con mi cuenta"). Si menciona un problema concreto (un cobro,
+  un fraude, una queja, un certificado), es FALSO aunque falten fecha, comercio o
+  monto. Ejemplo: "me cobraron dos veces y no reconozco el cargo" → false.
 - monto: el valor numérico si se menciona, null si no.
 - razon: máximo 20 palabras explicando tu clasificación.
 

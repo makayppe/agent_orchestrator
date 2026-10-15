@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from agentes import AGENTES, identificar_cliente
-from llm import Decision, Emocion, clasificar_emocion_raw, decidir, decidir_paralelo, redactar
+from llm import Decision, Emocion, clasificar_emocion_raw, decidir, decidir_paralelo, detecta_manipulacion, redactar
 
 
 # ─── Session state ────────────────────────────────────────────────────────────
@@ -110,7 +110,9 @@ class ResultadoProcesamiento:
     @classmethod
     def desde_dict(cls, d: dict) -> "ResultadoProcesamiento":
         r = cls()
-        r.decisiones = [Decision(**dd) for dd in d["decisiones"]]
+        # Resiliencia de caché: un cache.json grabado antes de agregar 'intencion'
+        # no la trae; se completa con un valor por defecto para no romper --replay.
+        r.decisiones = [Decision(**{"intencion": "solicitud", **dd}) for dd in d["decisiones"]]
         r.metricas_decision = d["metricas_decision"]
         r.agente_ganador = d["agente_ganador"]
         r.acuerdo = d["acuerdo"]
@@ -146,6 +148,10 @@ class ResultadoProcesamiento:
 # para no dejar al cliente atrapado en un bucle infinito de verificación.
 _MAX_INTENTOS_IDENTIFICACION = 3
 
+# Un mensaje con al menos estas palabras describe algo concreto: no se acepta que
+# el modelo lo declare "demasiado vago" (ver regla 7).
+_MIN_PALABRAS_NO_VAGO = 8
+
 
 def _hay_caso_en_sesion(session: SessionState) -> bool:
     """True si la sesión tiene un caso/acción previa a la que un seguimiento pueda referirse."""
@@ -166,11 +172,12 @@ def _extraer_hechos(resultados_agentes: list[dict]) -> dict:
     return hechos
 
 
-# Tickets con formato banco (REV-xxxxxxxx, BLQ-xxxxxxxx, …)
-_TICKET_PATTERN = re.compile(r"\b([A-Z]+-[0-9A-Fa-f]{8})\b")
-# Cualquier secuencia "larga" de dígitos que el redactor podría presentar como
-# número de caso/ticket (ej. "ticket 123456"). Umbral: ≥ 5 dígitos.
-_NUM_LARGO_PATTERN = re.compile(r"\b\d{5,}\b")
+# Cualquier código tipo "LETRAS-alfanumérico" que el redactor podría presentar
+# como ticket (REV-AABB1234, BLQ-xxxx, pero también un inventado TK-1234).
+_TICKET_PATTERN = re.compile(r"\b[A-Z]{2,}-[A-Za-z0-9]{2,}\b")
+# Montos: con separadores de miles (45.000 / 1.234.567 / 45,000) o secuencias
+# largas de dígitos (ej. "ticket 123456"). Captura ambos para cotejarlos.
+_NUM_MONTO_PATTERN = re.compile(r"\b\d{1,3}(?:[.,]\d{3})+\b|\b\d{4,}\b")
 
 
 def _normalizar_monto(valor: str) -> Optional[float]:
@@ -183,25 +190,26 @@ def _normalizar_monto(valor: str) -> Optional[float]:
 
 
 def _guardia_redactor(texto: str, hechos: dict) -> tuple[Optional[str], bool]:
-    """Verifica que todo ID/número de caso del texto esté entre los hechos conocidos.
+    """Verifica que todo ID/monto del texto esté entre los hechos conocidos.
 
-    Cubre tanto tickets con formato (REV-xxxxxxxx) como números sueltos largos
-    (ej. 'ticket 123456'). Un número suelto se considera legítimo solo si coincide
-    con un monto conocido; cualquier otro número largo se trata como inventado.
+    Cubre tickets con cualquier formato LETRAS-alfanumérico (REV-AABB1234, TK-1234)
+    y montos con o sin separadores de miles ($45.000, 87500). Un número se considera
+    legítimo solo si coincide con un monto conocido; cualquier otro se trata como
+    inventado.
 
     Returns (texto_verificado | None, guardia_activada).
-    Returns (None, True) si se detecta un ticket/número inventado.
+    Returns (None, True) si se detecta un ticket/monto inventado.
     """
-    # 1) Tickets con formato banco
+    # 1) Tickets: cualquier código LETRAS-alfanumérico que no esté entre los conocidos
     tickets_en_texto = {t.upper() for t in _TICKET_PATTERN.findall(texto)}
     tickets_conocidos = {t.upper() for t in hechos.get("tickets", set())}
     if tickets_en_texto - tickets_conocidos:
         return None, True
 
-    # 2) Números largos sueltos → solo válidos si son un monto conocido
+    # 2) Montos (con o sin separadores) → solo válidos si son un monto conocido
     montos_conocidos = {int(m) for m in hechos.get("montos", set())}
-    for num in _NUM_LARGO_PATTERN.findall(texto):
-        # Ignorar los que ya son parte de un ticket con formato
+    for num in _NUM_MONTO_PATTERN.findall(texto):
+        # Ignorar los que son parte de un ticket con formato (p. ej. "1234" en TK-1234)
         if any(num in t for t in tickets_en_texto):
             continue
         valor = _normalizar_monto(num)
@@ -217,19 +225,34 @@ def _mayoria(decisiones: list[Decision]) -> tuple[str, float]:
     return ganador, votos / len(decisiones)
 
 
+_PII_DIGITOS = re.compile(r"\d{4,}")
+
+
+def _enmascarar_pii(texto: str) -> str:
+    """Enmascara secuencias de 4+ dígitos (cédulas, cuentas) antes de auditar.
+    La auditoría no debe guardar datos sensibles en claro."""
+    return _PII_DIGITOS.sub("####", texto)
+
+
 def _registrar_auditoria(path: str, session: SessionState, mensaje: str, r: ResultadoProcesamiento) -> None:
     """Escribe una línea JSON por turno con lo decidido (registro para riesgo).
 
-    Determinista y legible: decisión, reglas disparadas, escalado y tickets.
+    Determinista y legible: intención, decisión, emoción, reglas, escalado y tickets.
+    El mensaje se guarda enmascarado (sin cédulas/cuentas en claro).
     """
+    intencion = r.decisiones[0].intencion if r.decisiones else None
     registro = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "session_id": session.id,
         "turno": session.turno,
         "cliente_id": session.cliente_id,
-        "mensaje": mensaje[:200],
+        "mensaje": _enmascarar_pii(mensaje[:200]),
+        "intencion": intencion,
         "agente_ganador": r.agente_ganador,
         "acuerdo": r.acuerdo,
+        "emocion": r.emocion.emocion if r.emocion else None,
+        "emocion_intensidad": r.emocion.intensidad if r.emocion else None,
+        "emocion_fuente": r.emocion_fuente,
         "agentes_ejecutados": r.agentes_ejecutados,
         "reglas_disparadas": [reg["num"] for reg in r.reglas_disparadas if reg.get("disparada")],
         "escalado_humano": r.escalado_humano,
@@ -299,9 +322,9 @@ class Orquestador:
             return self._fail_safe(mensaje, r, session)
         intencion = r.decisiones[0].intencion
 
-        # ── Manipulación (según el LLM) → bloqueo de seguridad (prioridad máxima,
-        # se detecta incluso si la sesión ya estaba escalada) ─────────────────
-        if intencion == "manipulacion":
+        # ── Manipulación (regla dura: LLM O piso en código) → bloqueo de
+        # seguridad (prioridad máxima, incluso si la sesión ya estaba escalada) ─
+        if intencion == "manipulacion" or detecta_manipulacion(mensaje):
             return self._bloquear_manipulacion(mensaje, r, session)
 
         # ── Sesión ya escalada → mantener en atención humana ──────────────────
@@ -326,16 +349,26 @@ class Orquestador:
             if self._clasificar(mensaje, r, session):
                 return self._fail_safe(mensaje, r, session)
             intencion = r.decisiones[0].intencion
-            if intencion == "manipulacion":
+            if intencion == "manipulacion" or detecta_manipulacion(mensaje):
                 return self._bloquear_manipulacion(mensaje, r, session)
 
-        # ── Seguimiento (según el LLM) sobre un caso existente ────────────────
-        if intencion == "seguimiento" and self.ronda == 3 and _hay_caso_en_sesion(session):
+        # ── Seguimiento (según el LLM) ────────────────────────────────────────
+        if intencion == "seguimiento" and self.ronda == 3:
+            if _hay_caso_en_sesion(session):
+                r.es_seguimiento = True
+                session.contactos_mismo_caso += 1
+                r = self._procesar_seguimiento(mensaje, r, session)
+                self._registrar_turno(session, mensaje, r.respuesta_final)
+                return r
+            # Pregunta por un caso que no existe en esta sesión → NO se ejecuta
+            # ningún agente (no se crea un reverso de la nada).
             r.es_seguimiento = True
-            session.contactos_mismo_caso += 1
-            r = self._procesar_seguimiento(mensaje, r, session)
-            session.historial.append({"turno": session.turno, "rol": "cliente", "texto": mensaje[:100]})
-            session.historial.append({"turno": session.turno, "rol": "sistema", "texto": r.respuesta_final})
+            r.respuesta_final = (
+                "No encuentro una gestión previa asociada a esta conversación. "
+                "¿Me cuenta qué necesita para ayudarle desde el inicio?"
+            )
+            self._actualizar_session_emocion(r, session)
+            self._registrar_turno(session, mensaje, r.respuesta_final)
             return r
 
         if self.ronda == 1:
@@ -346,6 +379,22 @@ class Orquestador:
         # ── Paso 2: Reglas de negocio ────────────────────────────────────────
         agentes = [r.agente_ganador]
         decision = r.decisiones[0]
+
+        # Reglas 1-3 son de corte anticipado (manipulación, fail-safe, sesión ya
+        # escalada): si llegamos aquí, por definición no dispararon. Se añaden como
+        # "no disparadas" para que la traza muestre las 10 reglas en cada turno.
+        r.reglas_disparadas.append({
+            "num": 1, "desc": "manipulación detectada → bloqueo inmediato (prioridad máxima)",
+            "disparada": False, "detalle": "",
+        })
+        r.reglas_disparadas.append({
+            "num": 2, "desc": "fail-safe: clasificador de decisión caído → escalar",
+            "disparada": False, "detalle": "",
+        })
+        r.reglas_disparadas.append({
+            "num": 3, "desc": "sesión ya escalada → mantener en atención humana",
+            "disparada": False, "detalle": "",
+        })
 
         # Regla 6: "no reconozco" → override indicio_fraude
         _FRASES_NO_RECONOZCO = ["no reconozco", "no autoricé", "no autorizo"]
@@ -387,7 +436,16 @@ class Orquestador:
         })
 
         # Regla 3: requiere_aclaracion → preguntar al cliente
-        regla3 = decision.requiere_aclaracion
+        # El modelo PROPONE pedir aclaración; el código decide si se acepta. Un 3B
+        # marca como "vagos" mensajes claros, así que solo se acepta si (a) no hay
+        # indicio de fraude —ante un posible fraude se contiene, no se pregunta— y
+        # (b) el mensaje es realmente corto.
+        ignorada = ""
+        if decision.requiere_aclaracion and hay_fraude:
+            ignorada = "ignorada: hay indicio de fraude, se actúa en vez de preguntar"
+        elif decision.requiere_aclaracion and len(mensaje.split()) >= _MIN_PALABRAS_NO_VAGO:
+            ignorada = f"ignorada: el mensaje tiene {len(mensaje.split())} palabras y describe un problema"
+        regla3 = decision.requiere_aclaracion and not ignorada
         if regla3:
             r.requiere_aclaracion = True
             r.respuesta_final = (
@@ -396,7 +454,7 @@ class Orquestador:
             )
         r.reglas_disparadas.append({
             "num": 7, "desc": "requiere_aclaracion → preguntar al cliente en lugar de enrutar",
-            "disparada": regla3, "detalle": "mensaje demasiado vago" if regla3 else "",
+            "disparada": regla3, "detalle": "mensaje demasiado vago" if regla3 else ignorada,
         })
 
         # Regla 4: autoconsistencia por debajo del umbral → escalar
@@ -436,8 +494,22 @@ class Orquestador:
             "detalle": f"emoción={emocion_actual}, intensidad={intensidad_actual}, contactos={session.contactos_mismo_caso}" if regla5 else "",
         })
 
+        # Regla 10: reverso por encima del tope / sin doble cobro claro → requiere
+        # confirmación. Se evalúa tras ejecutar agentes; se añade aquí como marco y
+        # se actualiza abajo para que la traza muestre la regla en cada turno.
+        regla10 = {
+            "num": 10, "desc": "reverso sobre el tope o sin doble cobro claro → requiere confirmación",
+            "disparada": False, "detalle": "",
+        }
+        r.reglas_disparadas.append(regla10)
+
         # Sort rules by number
         r.reglas_disparadas.sort(key=lambda x: x["num"])
+
+        # Escalar = lo decide una persona: no se ejecutan acciones automáticas.
+        # Lo único que se permite es CONTENER el fraude (bloqueo preventivo).
+        if r.escalado_humano:
+            agentes = [a for a in agentes if a == "FRAUDE"]
         r.agentes_a_ejecutar = agentes
 
         if regla3:
@@ -464,21 +536,38 @@ class Orquestador:
             r.agentes_ejecutados.append(nombre)
             resumenes.append(resultado["resumen"])
 
-        # Store results in session for follow-up idempotency
-        session.resultados_agentes_guardados = r.resultados_agentes
+        # ¿Algún agente pide confirmación del cliente (p. ej. reverso sobre el tope
+        # o sin doble cobro claro)? Entonces no se da por hecha ninguna acción.
+        requiere_confirmacion = any(
+            res.get("requiere_confirmacion") for res in r.resultados_agentes
+        )
+        if requiere_confirmacion:
+            regla10["disparada"] = True
+            regla10["detalle"] = "un agente requiere confirmación del cliente antes de actuar"
+
+        # Guardar resultados solo si hay acciones reales, para no pisar un caso
+        # previo con una lista vacía (p. ej. al escalar sin ejecutar agentes).
+        if r.resultados_agentes:
+            session.resultados_agentes_guardados = r.resultados_agentes
         hechos = _extraer_hechos(r.resultados_agentes)
         session.hechos = {k: list(v) if isinstance(v, set) else v for k, v in hechos.items()}
         hechos_set = hechos  # keep as sets for guard
 
         # ── Paso 4: Redacción con guardia ────────────────────────────────────
         if r.escalado_humano:
+            # Mensaje genérico al cliente: el motivo queda en la traza y la
+            # auditoría, no se le revela cómo se decide ni se promete un plazo.
             r.respuesta_final = (
-                f"Su caso ha sido escalado para atención especializada. "
-                f"Motivo: {r.razon_escalado}. "
-                "Un asesor se comunicará con usted en los próximos 30 minutos."
+                "Su caso será revisado por un asesor especializado, que le dará "
+                "seguimiento. Gracias por su comprensión."
             )
             r.metricas_redaccion = {"latencia_ms": 0, "tokens_prompt": 0, "tokens_respuesta": 0}
             session.escalado = True
+        elif requiere_confirmacion:
+            # No se fabrica un "listo": se le pide al cliente confirmar/elegir.
+            r.requiere_aclaracion = True
+            r.respuesta_final = "; ".join(resumenes)
+            r.metricas_redaccion = {"latencia_ms": 0, "tokens_prompt": 0, "tokens_respuesta": 0}
         else:
             texto_generado, metricas = redactar(
                 mensaje, r.agentes_ejecutados, "; ".join(resumenes),
@@ -675,9 +764,8 @@ class Orquestador:
 
         if r.escalado_humano:
             r.respuesta_final = (
-                f"Su caso ha sido escalado para atención especializada. "
-                f"Motivo: {r.razon_escalado}. "
-                "Un asesor se comunicará con usted en los próximos 30 minutos."
+                "Su caso será revisado por un asesor especializado, que le dará "
+                "seguimiento. Gracias por su comprensión."
             )
             session.escalado = True
         else:
