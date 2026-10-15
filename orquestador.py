@@ -28,6 +28,7 @@ class SessionState:
     cliente_nombre: Optional[str] = None
     cliente_cuenta: Optional[str] = None
     solicitud_pendiente: Optional[str] = None
+    intentos_identificacion: int = 0
     emocion_previa: str = "neutral"
     intensidad_previa: str = "baja"
     fallbacks_emocion_consecutivos: int = 0
@@ -71,6 +72,7 @@ class ResultadoProcesamiento:
     guardia_activada: bool = False
     requiere_identificacion: bool = False
     identificacion_ok: bool = False
+    saludo: bool = False
 
     # Paso 3: agentes
     agentes_ejecutados: list[str] = field(default_factory=list)
@@ -98,6 +100,7 @@ class ResultadoProcesamiento:
             "guardia_activada": self.guardia_activada,
             "requiere_identificacion": self.requiere_identificacion,
             "identificacion_ok": self.identificacion_ok,
+            "saludo": self.saludo,
             "agentes_ejecutados": self.agentes_ejecutados,
             "resultados_agentes": self.resultados_agentes,
             "respuesta_final": self.respuesta_final,
@@ -124,6 +127,7 @@ class ResultadoProcesamiento:
         r.guardia_activada = d.get("guardia_activada", False)
         r.requiere_identificacion = d.get("requiere_identificacion", False)
         r.identificacion_ok = d.get("identificacion_ok", False)
+        r.saludo = d.get("saludo", False)
         r.agentes_ejecutados = d["agentes_ejecutados"]
         r.resultados_agentes = d["resultados_agentes"]
         r.respuesta_final = d["respuesta_final"]
@@ -133,38 +137,19 @@ class ResultadoProcesamiento:
 
 # ─── Helper functions ─────────────────────────────────────────────────────────
 
-_PALABRAS_MANIPULACION = [
-    "ignora tus", "ignora todas", "olvida tus reglas", "olvida las reglas",
-    "eres libre", "sin restricciones", "reembolsa todo", "dame todo el dinero",
-    "bypass", "jailbreak", "actúa sin reglas", "sin límites",
-]
+# La intención del mensaje (saludo, manipulación, seguimiento, identificación,
+# solicitud, fuera de alcance) la determina el LLM en `Decision.intencion`, no
+# listas de palabras clave. Lo único que se verifica en código es el ESTADO de la
+# sesión (¿hay un caso guardado para un seguimiento?), que no es cuestión de NLU.
+
+# Tras este número de intentos fallidos de identificación se escala a humano,
+# para no dejar al cliente atrapado en un bucle infinito de verificación.
+_MAX_INTENTOS_IDENTIFICACION = 3
 
 
-def es_manipulacion(mensaje: str) -> bool:
-    msg = mensaje.lower()
-    return any(p in msg for p in _PALABRAS_MANIPULACION)
-
-
-def _parece_solicitud(mensaje: str) -> bool:
-    """Heurística: un mensaje con ≥3 palabras parece una solicitud real (no solo un ID)."""
-    return len(mensaje.split()) >= 3
-
-
-_PALABRAS_SEGUIMIENTO = [
-    "cuánto", "cuanto", "demora", "reverso", "mi caso", "qué pasó", "que paso",
-    "cuándo", "cuando", "estado", "me devuelven", "mi reverso", "mi ticket",
-    "ya lo", "lo procesaron", "alguna novedad", "novedad",
-]
-
-
-def es_seguimiento(mensaje: str, session: SessionState) -> bool:
-    if session.turno < 1:
-        return False
-    if not (session.reverso_id or session.caso_id or session.resultados_agentes_guardados):
-        return False
-    msg = mensaje.lower()
-    palabras = msg.split()
-    return len(palabras) <= 12 and any(p in msg for p in _PALABRAS_SEGUIMIENTO)
+def _hay_caso_en_sesion(session: SessionState) -> bool:
+    """True si la sesión tiene un caso/acción previa a la que un seguimiento pueda referirse."""
+    return bool(session.reverso_id or session.caso_id or session.resultados_agentes_guardados)
 
 
 def _extraer_hechos(resultados_agentes: list[dict]) -> dict:
@@ -307,142 +292,51 @@ class Orquestador:
         session.turno += 1
         r = ResultadoProcesamiento()
 
-        # ── REGLA 7 (máx. prioridad): Manipulación ───────────────────────────
-        if es_manipulacion(mensaje):
-            r.manipulacion_detectada = True
-            r.escalado_humano = True
-            r.razon_escalado = "Intento de manipulación detectado en el mensaje"
-            r.respuesta_final = (
-                "Esta solicitud ha sido marcada para revisión de seguridad. "
-                "Un especialista revisará su caso."
-            )
-            r.reglas_disparadas.append({
-                "num": 1, "desc": "manipulación detectada → bloqueo inmediato (prioridad máxima)",
-                "disparada": True, "detalle": "Se detectaron instrucciones para eludir reglas del sistema",
-            })
-            session.escalado = True
-            session.historial.append({"turno": session.turno, "rol": "cliente", "texto": mensaje[:100]})
-            session.historial.append({"turno": session.turno, "rol": "sistema", "texto": r.respuesta_final})
-            return r
+        # ── Paso 1: clasificar el mensaje con el LLM (decisión + emoción) ─────
+        # La INTENCIÓN (saludo, manipulación, seguimiento, identificación, …) la
+        # determina el modelo a partir del system prompt, no listas de palabras.
+        if self._clasificar(mensaje, r, session):
+            return self._fail_safe(mensaje, r, session)
+        intencion = r.decisiones[0].intencion
+
+        # ── Manipulación (según el LLM) → bloqueo de seguridad (prioridad máxima,
+        # se detecta incluso si la sesión ya estaba escalada) ─────────────────
+        if intencion == "manipulacion":
+            return self._bloquear_manipulacion(mensaje, r, session)
+
+        # ── Sesión ya escalada → mantener en atención humana ──────────────────
+        if session.escalado:
+            return self._mantener_escalado(mensaje, r, session)
+
+        # ── Saludo → responder como saludo, sin exigir datos todavía ──────────
+        if intencion == "saludo":
+            return self._responder_saludo(mensaje, r, session)
 
         # ── Identificación del cliente (solo en modo chat) ───────────────────
         if self.requiere_identificacion and not session.cliente_id:
-            continuar = self._gate_identificacion(mensaje, r, session)
-            if not continuar:
+            pendiente = self._gate_identificacion(mensaje, r, session, intencion)
+            if pendiente is None:
+                self._actualizar_session_emocion(r, session)
                 return r
-            # Identificado con solicitud pendiente: procesar esa solicitud ahora
-            mensaje = continuar
+            # Identificado con una solicitud pendiente → clasificar y procesar la
+            # solicitud real (el mensaje actual era solo la identificación).
+            mensaje = pendiente
+            r = ResultadoProcesamiento()
+            r.identificacion_ok = True
+            if self._clasificar(mensaje, r, session):
+                return self._fail_safe(mensaje, r, session)
+            intencion = r.decisiones[0].intencion
+            if intencion == "manipulacion":
+                return self._bloquear_manipulacion(mensaje, r, session)
 
-        # ── REGLA 8: Sesión ya escalada ──────────────────────────────────────
-        if session.escalado:
-            r.escalado_humano = True
-            r.razon_escalado = "Sesión previamente escalada a atención humana"
-            r.respuesta_final = (
-                "Su caso está siendo atendido por un asesor especializado. "
-                "No se requieren más acciones de su parte."
-            )
-            r.reglas_disparadas.append({
-                "num": 3, "desc": "sesión ya escalada → mantener en atención humana",
-                "disparada": True, "detalle": session.razon_escalado,
-            })
-            session.contactos_mismo_caso += 1
-            session.historial.append({"turno": session.turno, "rol": "cliente", "texto": mensaje[:100]})
-            session.historial.append({"turno": session.turno, "rol": "sistema", "texto": r.respuesta_final})
-            return r
-
-        # ── Seguimiento: usar estado guardado ────────────────────────────────
-        if es_seguimiento(mensaje, session) and self.ronda == 3:
+        # ── Seguimiento (según el LLM) sobre un caso existente ────────────────
+        if intencion == "seguimiento" and self.ronda == 3 and _hay_caso_en_sesion(session):
             r.es_seguimiento = True
-            # Un seguimiento sobre un caso existente SÍ cuenta como contacto.
             session.contactos_mismo_caso += 1
             r = self._procesar_seguimiento(mensaje, r, session)
             session.historial.append({"turno": session.turno, "rol": "cliente", "texto": mensaje[:100]})
             session.historial.append({"turno": session.turno, "rol": "sistema", "texto": r.respuesta_final})
             return r
-
-        # ── Paso 1: Decisiones + emoción en paralelo ─────────────────────────
-        # No usamos `with`: su __exit__ hace shutdown(wait=True) y anularía el
-        # timeout de emoción (esperaría al hilo igual). Cerramos sin esperar.
-        decision_results = []
-        emocion_raw = None
-        emocion_timed_out = False
-
-        executor = ThreadPoolExecutor(max_workers=self.corridas + 1)
-        try:
-            fut_decisions = [
-                executor.submit(decidir, mensaje, self.modelo_decision, self.mock, self.temperatura)
-                for _ in range(self.corridas)
-            ]
-            fut_emocion = executor.submit(
-                clasificar_emocion_raw,
-                mensaje, self.modelo_decision, self.mock, self.emotion_delay_ms,
-            )
-
-            for fut in fut_decisions:
-                try:
-                    decision_results.append(fut.result(timeout=self.decision_timeout_ms / 1000))
-                except Exception:
-                    pass
-
-            try:
-                emocion_raw = fut_emocion.result(timeout=self.emotion_timeout_ms / 1000)
-                emocion_timed_out = False
-            except Exception:
-                emocion_timed_out = True
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-
-        if not decision_results:
-            from llm import _mock_decision
-            decision_results = [(_mock_decision(mensaje), {"latencia_ms": 0, "tokens_prompt": 0, "tokens_respuesta": 0, "modelo": "fallback-mock", "es_fallback": True})]
-
-        for d, m in decision_results:
-            r.decisiones.append(d)
-            r.metricas_decision.append(m)
-
-        r.agente_ganador, r.acuerdo = _mayoria(r.decisiones)
-
-        # ── FAIL-SAFE: si el clasificador de decisión no está disponible (todas
-        # las corridas cayeron a respaldo por palabras clave), NO se ejecutan
-        # agentes con esa clasificación: se escala a humano.
-        clasificador_caido = not self.mock and all(
-            m.get("es_fallback") for m in r.metricas_decision
-        )
-        if clasificador_caido:
-            r.escalado_humano = True
-            r.razon_escalado = "Clasificador de decisión no disponible — escalado por seguridad (fail-safe)"
-            r.reglas_disparadas.append({
-                "num": 2, "desc": "fail-safe: clasificador de decisión caído → escalar",
-                "disparada": True, "detalle": "todas las corridas usaron respaldo por palabras clave",
-            })
-            r.respuesta_final = (
-                "Estamos teniendo una dificultad técnica para procesar su solicitud de forma segura. "
-                "Un asesor revisará su caso en breve."
-            )
-            session.escalado = True
-            session.razon_escalado = r.razon_escalado
-            self._actualizar_session_emocion(r, session)
-            session.historial.append({"turno": session.turno, "rol": "cliente", "texto": mensaje[:100]})
-            session.historial.append({"turno": session.turno, "rol": "sistema", "texto": r.respuesta_final})
-            return r
-
-        # ── Emoción: fallback a t-1 si timeout ───────────────────────────────
-        if emocion_timed_out:
-            session.fallbacks_emocion_consecutivos += 1
-            if session.fallbacks_emocion_consecutivos >= 2:
-                r.emocion = Emocion(emocion="desconocida", intensidad="media", razon="Demasiados timeouts consecutivos")
-                r.emocion_fuente = "desconocida"
-            else:
-                r.emocion = Emocion(
-                    emocion=session.emocion_previa,
-                    intensidad=session.intensidad_previa,
-                    razon="Timeout — usando emoción del turno anterior",
-                )
-                r.emocion_fuente = "t-1"
-        else:
-            session.fallbacks_emocion_consecutivos = 0
-            r.emocion = emocion_raw
-            r.emocion_fuente = "t"
 
         if self.ronda == 1:
             r.agentes_a_ejecutar = [r.agente_ganador]
@@ -606,35 +500,58 @@ class Orquestador:
         session.historial.append({"turno": session.turno, "rol": "sistema", "texto": r.respuesta_final[:200]})
         return r
 
-    def _procesar_seguimiento(
-        self, mensaje: str, r: ResultadoProcesamiento, session: SessionState
-    ) -> ResultadoProcesamiento:
-        """Handle follow-up questions using stored session state."""
-        r.resultados_agentes = session.resultados_agentes_guardados
-        r.agentes_ejecutados = [res["agente"] for res in r.resultados_agentes]
-        r.agentes_a_ejecutar = r.agentes_ejecutados
+    def _clasificar(self, mensaje: str, r: ResultadoProcesamiento, session: SessionState) -> bool:
+        """Clasifica el mensaje con el LLM (decisión + emoción en paralelo).
 
-        # Run emotion in background (with timeout) — still needed for rule 5.
-        # Sin `with`: evitamos que shutdown(wait=True) anule el timeout.
+        Puebla r.decisiones, métricas, agente_ganador, acuerdo y emoción.
+        Devuelve True si el clasificador cayó (todas las corridas en fallback),
+        para que el llamador aplique el fail-safe.
+        """
+        # No usamos `with`: su __exit__ hace shutdown(wait=True) y anularía el
+        # timeout de emoción (esperaría al hilo igual). Cerramos sin esperar.
+        decision_results = []
         emocion_raw = None
         emocion_timed_out = False
-        executor = ThreadPoolExecutor(max_workers=1)
+
+        executor = ThreadPoolExecutor(max_workers=self.corridas + 1)
         try:
-            fut_em = executor.submit(
+            fut_decisions = [
+                executor.submit(decidir, mensaje, self.modelo_decision, self.mock, self.temperatura)
+                for _ in range(self.corridas)
+            ]
+            fut_emocion = executor.submit(
                 clasificar_emocion_raw,
                 mensaje, self.modelo_decision, self.mock, self.emotion_delay_ms,
             )
+            for fut in fut_decisions:
+                try:
+                    decision_results.append(fut.result(timeout=self.decision_timeout_ms / 1000))
+                except Exception:
+                    pass
             try:
-                emocion_raw = fut_em.result(timeout=self.emotion_timeout_ms / 1000)
+                emocion_raw = fut_emocion.result(timeout=self.emotion_timeout_ms / 1000)
             except Exception:
                 emocion_timed_out = True
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
+        if not decision_results:
+            from llm import _mock_decision
+            decision_results = [(_mock_decision(mensaje), {
+                "latencia_ms": 0, "tokens_prompt": 0, "tokens_respuesta": 0,
+                "modelo": "fallback-mock", "es_fallback": True,
+            })]
+
+        for d, m in decision_results:
+            r.decisiones.append(d)
+            r.metricas_decision.append(m)
+        r.agente_ganador, r.acuerdo = _mayoria(r.decisiones)
+
+        # Emoción: fallback a t-1 si timeout
         if emocion_timed_out:
             session.fallbacks_emocion_consecutivos += 1
             if session.fallbacks_emocion_consecutivos >= 2:
-                r.emocion = Emocion(emocion="desconocida", intensidad="media", razon="Demasiados timeouts")
+                r.emocion = Emocion(emocion="desconocida", intensidad="media", razon="Demasiados timeouts consecutivos")
                 r.emocion_fuente = "desconocida"
             else:
                 r.emocion = Emocion(
@@ -648,7 +565,94 @@ class Orquestador:
             r.emocion = emocion_raw
             r.emocion_fuente = "t"
 
-        # Check rule 5 on follow-up (anger + contacts ≥ 2)
+        # Fail-safe: clasificador caído (solo fuera de modo mock)
+        return not self.mock and all(m.get("es_fallback") for m in r.metricas_decision)
+
+    def _fail_safe(self, mensaje: str, r: ResultadoProcesamiento, session: SessionState) -> ResultadoProcesamiento:
+        """Clasificador no disponible → escalar a humano sin ejecutar agentes."""
+        r.escalado_humano = True
+        r.razon_escalado = "Clasificador de decisión no disponible — escalado por seguridad (fail-safe)"
+        r.reglas_disparadas.append({
+            "num": 2, "desc": "fail-safe: clasificador de decisión caído → escalar",
+            "disparada": True, "detalle": "todas las corridas usaron respaldo por palabras clave",
+        })
+        r.respuesta_final = (
+            "Estamos teniendo una dificultad técnica para procesar su solicitud de forma segura. "
+            "Un asesor revisará su caso en breve."
+        )
+        session.escalado = True
+        session.razon_escalado = r.razon_escalado
+        self._actualizar_session_emocion(r, session)
+        self._registrar_turno(session, mensaje, r.respuesta_final)
+        return r
+
+    def _bloquear_manipulacion(self, mensaje: str, r: ResultadoProcesamiento, session: SessionState) -> ResultadoProcesamiento:
+        """Intención de manipulación detectada por el LLM → bloqueo de seguridad."""
+        r.manipulacion_detectada = True
+        r.escalado_humano = True
+        r.razon_escalado = "Intento de manipulación detectado en el mensaje"
+        r.respuesta_final = (
+            "Esta solicitud ha sido marcada para revisión de seguridad. "
+            "Un especialista revisará su caso."
+        )
+        r.reglas_disparadas.append({
+            "num": 1, "desc": "manipulación detectada → bloqueo inmediato (prioridad máxima)",
+            "disparada": True, "detalle": "El modelo identificó un intento de eludir las reglas del sistema",
+        })
+        session.escalado = True
+        self._actualizar_session_emocion(r, session)
+        self._registrar_turno(session, mensaje, r.respuesta_final)
+        return r
+
+    def _mantener_escalado(self, mensaje: str, r: ResultadoProcesamiento, session: SessionState) -> ResultadoProcesamiento:
+        """Sesión ya escalada → se mantiene en atención humana."""
+        r.escalado_humano = True
+        r.razon_escalado = "Sesión previamente escalada a atención humana"
+        r.respuesta_final = (
+            "Su caso está siendo atendido por un asesor especializado. "
+            "No se requieren más acciones de su parte."
+        )
+        r.reglas_disparadas.append({
+            "num": 3, "desc": "sesión ya escalada → mantener en atención humana",
+            "disparada": True, "detalle": session.razon_escalado,
+        })
+        session.contactos_mismo_caso += 1
+        self._registrar_turno(session, mensaje, r.respuesta_final)
+        return r
+
+    def _responder_saludo(self, mensaje: str, r: ResultadoProcesamiento, session: SessionState) -> ResultadoProcesamiento:
+        """Saludo/charla: responder cordialmente sin exigir datos todavía."""
+        r.saludo = True
+        if session.cliente_nombre:
+            primer_nombre = session.cliente_nombre.split()[0]
+            r.respuesta_final = f"¡Hola, {primer_nombre}! ¿En qué puedo ayudarle hoy?"
+        else:
+            r.respuesta_final = (
+                "¡Hola! Soy su asistente del banco. Cuénteme en qué puedo ayudarle "
+                "(por ejemplo, un cobro que no reconoce, un reverso o una queja) y "
+                "enseguida verificaré su identidad para atenderle de forma segura."
+            )
+        self._actualizar_session_emocion(r, session)
+        self._registrar_turno(session, mensaje, r.respuesta_final)
+        return r
+
+    def _registrar_turno(self, session: SessionState, mensaje: str, respuesta: str) -> None:
+        session.historial.append({"turno": session.turno, "rol": "cliente", "texto": mensaje[:100]})
+        session.historial.append({"turno": session.turno, "rol": "sistema", "texto": respuesta[:200]})
+
+    def _procesar_seguimiento(
+        self, mensaje: str, r: ResultadoProcesamiento, session: SessionState
+    ) -> ResultadoProcesamiento:
+        """Handle follow-up questions using stored session state.
+
+        La emoción ya fue clasificada en `_clasificar` (está en r.emocion), así que
+        aquí NO se vuelve a llamar al modelo: se reutiliza.
+        """
+        r.resultados_agentes = session.resultados_agentes_guardados
+        r.agentes_ejecutados = [res["agente"] for res in r.resultados_agentes]
+        r.agentes_a_ejecutar = r.agentes_ejecutados
+
+        # Check rule 9 on follow-up (anger + contacts ≥ 2)
         emocion_actual = r.emocion.emocion if r.emocion else session.emocion_previa
         intensidad_actual = r.emocion.intensidad if r.emocion else session.intensidad_previa
         regla5 = (
@@ -698,18 +702,19 @@ class Orquestador:
         self._actualizar_session_emocion(r, session)
         return r
 
-    def _gate_identificacion(self, mensaje: str, r: ResultadoProcesamiento, session: SessionState):
+    def _gate_identificacion(self, mensaje: str, r: ResultadoProcesamiento, session: SessionState, intencion: str):
         """Puerta de identificación del cliente.
 
         Devuelve el mensaje a procesar (str) si el cliente se identificó y hay una
-        solicitud pendiente; devuelve None si pidió identificación o solo saludó
-        (en cuyo caso el llamador debe terminar el turno).
+        solicitud pendiente; devuelve None si pidió identificación o escaló (en cuyo
+        caso el llamador debe terminar el turno). `intencion` la aporta el LLM.
         """
         cliente = identificar_cliente(mensaje)
         if cliente:
             session.cliente_id = cliente["id"]
             session.cliente_nombre = cliente["nombre"]
             session.cliente_cuenta = cliente["cuenta"]
+            session.intentos_identificacion = 0
             r.identificacion_ok = True
             if session.solicitud_pendiente:
                 pendiente = session.solicitud_pendiente
@@ -720,20 +725,48 @@ class Orquestador:
                 f"Gracias, {primer_nombre}. Su identidad fue verificada. "
                 "¿En qué puedo ayudarle hoy?"
             )
-            session.historial.append({"turno": session.turno, "rol": "cliente", "texto": mensaje[:100]})
-            session.historial.append({"turno": session.turno, "rol": "sistema", "texto": r.respuesta_final})
+            self._registrar_turno(session, mensaje, r.respuesta_final)
             return None
 
-        # No se encontró identificador → pedirlo y recordar la solicitud
-        if _parece_solicitud(mensaje):
+        # ¿El cliente intentó identificarse? Es un chequeo de DATOS (¿mandó un
+        # número candidato?), no de intención: un mensaje largo y natural como
+        # "mi documento es X y los últimos dígitos son Y" debe contar como intento
+        # aunque el clasificador lo etiquete como 'solicitud'.
+        trajo_candidato_id = re.search(r"\d{4,}", mensaje) is not None
+
+        if trajo_candidato_id:
+            # Mandó un número que no coincidió → intento fallido. No sobrescribimos
+            # la solicitud pendiente: seguía intentando verificarse.
+            session.intentos_identificacion += 1
+        elif intencion in ("solicitud", "seguimiento") and not session.solicitud_pendiente:
+            # Planteó una necesidad sin datos → la recordamos para atenderla luego.
             session.solicitud_pendiente = mensaje
+
+        # Tope de intentos → escalar a humano para romper el bucle.
+        if session.intentos_identificacion >= _MAX_INTENTOS_IDENTIFICACION:
+            r.escalado_humano = True
+            r.razon_escalado = (
+                f"No se pudo verificar la identidad tras {session.intentos_identificacion} intentos"
+            )
+            r.respuesta_final = (
+                "No pudimos verificar su identidad tras varios intentos. "
+                "Por seguridad, un asesor retomará su caso o puede acercarse a una sucursal."
+            )
+            session.escalado = True
+            session.razon_escalado = r.razon_escalado
+            self._registrar_turno(session, mensaje, r.respuesta_final)
+            return None
+
         r.requiere_identificacion = True
+        intentos_txt = (
+            f" (intento {session.intentos_identificacion} de {_MAX_INTENTOS_IDENTIFICACION})"
+            if session.intentos_identificacion else ""
+        )
         r.respuesta_final = (
             "Para ayudarle de forma segura, ¿me confirma su número de documento "
-            "o los últimos 4 dígitos de su cuenta?"
+            f"o los últimos 4 dígitos de su cuenta?{intentos_txt}"
         )
-        session.historial.append({"turno": session.turno, "rol": "cliente", "texto": mensaje[:100]})
-        session.historial.append({"turno": session.turno, "rol": "sistema", "texto": r.respuesta_final})
+        self._registrar_turno(session, mensaje, r.respuesta_final)
         return None
 
     def _actualizar_session_emocion(self, r: ResultadoProcesamiento, session: SessionState):

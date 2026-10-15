@@ -90,6 +90,14 @@ def mostrar_traza(r, mensaje: str, args, sesion_num: int = 0):
         _mostrar_respuesta(r)
         return
 
+    # Saludo → solo la respuesta cordial (no hay acción bancaria)
+    if getattr(r, "saludo", False):
+        console.print(Panel(
+            f"[green]{r.respuesta_final}[/]",
+            title="[cyan]SALUDO[/]", border_style="cyan", padding=(0, 2),
+        ))
+        return
+
     # Identificación requerida (modo chat, cliente aún no verificado)
     if getattr(r, "requiere_identificacion", False):
         console.print(Panel(

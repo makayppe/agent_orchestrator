@@ -30,12 +30,30 @@ def _do_chat(**kwargs):
 # ─── Decision model ───────────────────────────────────────────────────────────
 
 class Decision(BaseModel):
+    intencion: str   # saludo|identificacion|solicitud|seguimiento|manipulacion|fuera_de_alcance
     agente: str
     indicio_fraude: bool
     urgencia: int
     requiere_aclaracion: bool
     monto: Optional[float] = None
     razon: str
+
+    @field_validator("intencion", mode="before")
+    @classmethod
+    def normalizar_intencion(cls, v: str) -> str:
+        validos = {
+            "saludo", "identificacion", "solicitud",
+            "seguimiento", "manipulacion", "fuera_de_alcance",
+        }
+        v_norm = str(v).lower().strip().replace(" ", "_")
+        v_norm = (v_norm.replace("ó", "o").replace("í", "i")
+                  .replace("á", "a").replace("é", "e").replace("ú", "u"))
+        if v_norm in validos:
+            return v_norm
+        for op in validos:
+            if op in v_norm:
+                return op
+        return "solicitud"
 
     @field_validator("agente", mode="before")
     @classmethod
@@ -115,7 +133,12 @@ _SISTEMA_REDACCION = _cargar_prompt("redaccion")
 # ─── Mock helpers ─────────────────────────────────────────────────────────────
 
 def _mock_decision(mensaje: str) -> Decision:
+    """Clasificación de respaldo por palabras clave. Solo se usa en modo mock
+    (sin LLM) o como fallback si el modelo falla. En el flujo real la intención la
+    determina el LLM a partir del system prompt, no estas listas."""
     msg = mensaje.lower()
+    palabras = msg.split()
+    tiene_id = re.search(r"\d{4,}", mensaje) is not None
 
     indicio_fraude = any(w in msg for w in [
         "no reconozco", "no autoricé", "no autorizo",
@@ -123,14 +146,28 @@ def _mock_decision(mensaje: str) -> Decision:
         "phishing", "suplantaron", "estaba dormido",
     ])
 
-    if any(w in msg for w in ["ignora", "olvida", "pretende ser", "actúa como", "sin restricciones",
-                               "reembolsa todo", "bypass", "jailbreak"]):
-        return Decision(
-            agente="FUERA_DE_ALCANCE", indicio_fraude=False, urgencia=1,
-            requiere_aclaracion=False, monto=None,
-            razon="Mensaje no corresponde a servicios bancarios",
-        )
+    # ── Intención (mock) ────────────────────────────────────────────────────
+    es_manipulacion = any(w in msg for w in [
+        "ignora", "olvida", "pretende ser", "actúa como", "sin restricciones",
+        "reembolsa todo", "bypass", "jailbreak", "sin límites", "eres libre",
+    ])
+    es_seguimiento = any(w in msg for w in [
+        "cuánto demora", "cuanto demora", "ya lo procesaron", "ya procesaron",
+        "alguna novedad", "novedad", "qué pasó con", "que paso con", "cómo va",
+        "como va", "estado de mi", "mi reverso", "mi caso", "mi ticket",
+    ])
+    es_saludo = (
+        len(palabras) <= 3
+        and any(w in msg for w in [
+            "hola", "holi", "buenas", "buenos días", "buenos dias", "buen día",
+            "buen dia", "qué tal", "que tal", "saludos", "hey",
+        ])
+    )
+    es_fuera = any(w in msg for w in [
+        "receta", "clima", "fútbol", "futbol", "chiste", "bandeja", "paisa",
+    ])
 
+    # ── Agente ──────────────────────────────────────────────────────────────
     if any(w in msg for w in ["doble cobro", "dos veces", "duplicado", "reverso", "devolver",
                                "me descontaron", "no me entregó", "no llegó", "suscripción",
                                "cajero", "transferencia", "cargos", "cobrado"]):
@@ -140,15 +177,28 @@ def _mock_decision(mensaje: str) -> Decision:
     elif any(w in msg for w in ["queja", "reclamo", "certificado", "información",
                                  "tasa", "producto", "servicio", "sucursal", "tramit"]):
         agente, urgencia = "PQR", 2
-    elif not any(c.isalpha() for c in msg) or len(msg.split()) < 3:
-        agente, urgencia = "PQR", 1
-    elif any(w in msg for w in ["receta", "clima", "fútbol", "futbol", "chiste", "hola",
-                                  "bandeja", "paisa"]):
+    elif es_fuera:
         agente, urgencia = "FUERA_DE_ALCANCE", 1
     else:
         agente, urgencia = "PQR", 2
 
-    requiere_aclaracion = len(msg.split()) < 6 and agente == "PQR"
+    # ── Resolver intención final ────────────────────────────────────────────
+    if es_manipulacion:
+        intencion = "manipulacion"
+    elif es_saludo:
+        intencion = "saludo"
+    elif es_seguimiento:
+        intencion = "seguimiento"
+    elif tiene_id and len(palabras) <= 6 and agente == "PQR":
+        intencion = "identificacion"
+    elif agente == "FUERA_DE_ALCANCE":
+        intencion = "fuera_de_alcance"
+    else:
+        intencion = "solicitud"
+
+    requiere_aclaracion = (
+        intencion == "solicitud" and len(palabras) < 6 and agente == "PQR"
+    )
 
     monto = None
     m = re.search(r"\$?\s*(\d[\d.,]+)", mensaje)
@@ -159,8 +209,8 @@ def _mock_decision(mensaje: str) -> Decision:
             pass
 
     return Decision(
-        agente=agente, indicio_fraude=indicio_fraude, urgencia=urgencia,
-        requiere_aclaracion=requiere_aclaracion, monto=monto,
+        intencion=intencion, agente=agente, indicio_fraude=indicio_fraude,
+        urgencia=urgencia, requiere_aclaracion=requiere_aclaracion, monto=monto,
         razon="Clasificación por palabras clave (modo mock)",
     )
 

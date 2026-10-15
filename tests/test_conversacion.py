@@ -167,6 +167,7 @@ def test_fake_client_decision():
     from llm import Decision
 
     decision_json = json.dumps({
+        "intencion": "solicitud",
         "agente": "FRAUDE",
         "indicio_fraude": True,
         "urgencia": 4,
