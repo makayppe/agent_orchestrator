@@ -4,7 +4,6 @@ Orquestador bancario con LLMs locales. Triaje de mensajes de clientes (tarjetas 
 
 **Idea central: el LLM propone, el código dispone.** El modelo clasifica (agente, urgencia, indicio de fraude, emoción). Los controles de negocio (umbrales, escalamiento a humano, anti-manipulación) están en código, son deterministas y auditables.
 
-Taller BINTEC 2026 · Marco Antonio Caipe Balcázar
 
 ## Qué hace
 
